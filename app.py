@@ -124,6 +124,7 @@ st.html(
 
 MODEL_ID = "weed-detection-bounding-boxes/2"
 API_URL = "https://serverless.roboflow.com"
+ROI_TOP_RATIO = 0.42
 
 
 def get_api_key():
@@ -190,7 +191,14 @@ def annotate_image(image, predictions):
     return output, targets
 
 
-def code_panel(filename, targets=None, status="ready", error=None):
+def code_panel(
+    filename,
+    targets=None,
+    raw_count=None,
+    outside_roi_count=None,
+    status="ready",
+    error=None,
+):
     lines = [
         '<span class="code-comment"># realtime_detection.py</span>',
         '<span class="code-key">import</span> requests  <span class="code-comment"># Roboflow hosted inference</span>',
@@ -207,7 +215,15 @@ def code_panel(filename, targets=None, status="ready", error=None):
     elif error:
         lines.append(f'<span class="log-time">[00:00.031]</span> <span class="log-target">ERROR</span> {error}')
     elif targets is not None:
-        lines.append(f'<span class="log-time">[00:01.284]</span> <span class="log-ok">DONE</span>  predictions.count = {len(targets)}')
+        raw_count = len(targets) if raw_count is None else raw_count
+        outside_roi_count = 0 if outside_roi_count is None else outside_roi_count
+        lines.extend(
+            [
+                f'<span class="log-time">[00:01.284]</span> <span class="log-info">RAW</span>   predictions.count = {raw_count}',
+                f'<span class="log-time">[00:01.285]</span> <span class="log-target">FILTER</span> outside_roi = {outside_roi_count}',
+                f'<span class="log-time">[00:01.286]</span> <span class="log-ok">VALID</span> targets.count = {len(targets)}',
+            ]
+        )
         for i, (x, y, confidence) in enumerate(targets, start=1):
             lines.append(
                 f'<span class="log-time">[{i:02d}]</span> <span class="log-target">TARGET</span> '
@@ -271,8 +287,17 @@ if uploaded_file:
     with code_col:
         st.html('<div class="section-label"><b>Runtime</b> · inference stream</div>')
         code_slot = st.empty()
-        current_targets = st.session_state.detection["targets"] if st.session_state.detection else None
-        code_slot.html(code_panel(uploaded_file.name, current_targets, error=st.session_state.detection_error))
+        current_detection = st.session_state.detection
+        current_targets = current_detection["targets"] if current_detection else None
+        code_slot.html(
+            code_panel(
+                uploaded_file.name,
+                current_targets,
+                raw_count=current_detection.get("raw_count") if current_detection else None,
+                outside_roi_count=current_detection.get("outside_roi_count") if current_detection else None,
+                error=st.session_state.detection_error,
+            )
+        )
 
     if detect_clicked:
         code_slot.html(code_panel(uploaded_file.name, status="running"))
@@ -280,12 +305,26 @@ if uploaded_file:
         try:
             with st.spinner("Running inference…"):
                 result = run_inference(image, get_api_key())
-                predictions = result.get("predictions", [])
+                raw_predictions = result.get("predictions", [])
+                raw_count = len(raw_predictions)
+                img_width, img_height = image.size
+
+                # The camera is fixed above the pot. Discard detections whose
+                # centre lies in the upper background, outside the pot workspace.
+                predictions = [
+                    pred
+                    for pred in raw_predictions
+                    if pred["y"] >= img_height * ROI_TOP_RATIO
+                ]
+                outside_roi_count = raw_count - len(predictions)
+
                 output, targets = annotate_image(image, predictions)
                 st.session_state.detection = {
                     "output": output,
                     "targets": targets,
                     "predictions": predictions,
+                    "raw_count": raw_count,
+                    "outside_roi_count": outside_roi_count,
                 }
         except Exception as exc:
             st.session_state.detection = None
