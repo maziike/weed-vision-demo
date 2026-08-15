@@ -1,9 +1,9 @@
+import base64
 import os
-import tempfile
-from pathlib import Path
+from io import BytesIO
 
+import requests
 import streamlit as st
-from inference_sdk import InferenceHTTPClient
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -141,9 +141,20 @@ def get_api_key():
     return api_key
 
 
-@st.cache_resource
-def get_client(api_key):
-    return InferenceHTTPClient(api_url=API_URL, api_key=api_key)
+def run_inference(image, api_key):
+    """Call Roboflow's hosted endpoint without importing the OpenCV-heavy SDK."""
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    encoded_image = base64.b64encode(buffer.getvalue()).decode("ascii")
+    response = requests.post(
+        f"{API_URL}/{MODEL_ID}",
+        params={"api_key": api_key},
+        data=encoded_image,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def annotate_image(image, predictions):
@@ -182,7 +193,7 @@ def annotate_image(image, predictions):
 def code_panel(filename, targets=None, status="ready", error=None):
     lines = [
         '<span class="code-comment"># realtime_detection.py</span>',
-        '<span class="code-key">from</span> inference_sdk <span class="code-key">import</span> InferenceHTTPClient',
+        '<span class="code-key">import</span> requests  <span class="code-comment"># Roboflow hosted inference</span>',
         '',
         f'<span class="log-time">[00:00.000]</span> <span class="log-info">INFO</span>  model.resolve(<span class="code-string">"{MODEL_ID}"</span>)',
     ]
@@ -192,7 +203,7 @@ def code_panel(filename, targets=None, status="ready", error=None):
         lines.append('<span class="log-time">[--:--.---]</span> <span class="code-comment">WAIT  image input required</span>')
 
     if status == "running":
-        lines.append('<span class="log-time">[00:00.031]</span> <span class="log-info">RUN</span>   client.infer(image, model_id)')
+        lines.append('<span class="log-time">[00:00.031]</span> <span class="log-info">RUN</span>   requests.post(model_endpoint, image)')
     elif error:
         lines.append(f'<span class="log-time">[00:00.031]</span> <span class="log-target">ERROR</span> {error}')
     elif targets is not None:
@@ -266,13 +277,9 @@ if uploaded_file:
     if detect_clicked:
         code_slot.html(code_panel(uploaded_file.name, status="running"))
         st.session_state.detection_error = None
-        temp_path = None
         try:
             with st.spinner("Running inference…"):
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
-                    image.save(temp.name, format="JPEG")
-                    temp_path = temp.name
-                result = get_client(get_api_key()).infer(temp_path, model_id=MODEL_ID)
+                result = run_inference(image, get_api_key())
                 predictions = result.get("predictions", [])
                 output, targets = annotate_image(image, predictions)
                 st.session_state.detection = {
@@ -283,9 +290,6 @@ if uploaded_file:
         except Exception as exc:
             st.session_state.detection = None
             st.session_state.detection_error = str(exc)
-        finally:
-            if temp_path:
-                Path(temp_path).unlink(missing_ok=True)
         st.rerun()
 
     detection = st.session_state.detection
