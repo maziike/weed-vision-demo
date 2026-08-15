@@ -4,6 +4,7 @@ from io import BytesIO
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -120,7 +121,6 @@ st.html(
     </style>
     """
 )
-
 
 MODEL_ID = "weed-detection-bounding-boxes/2"
 API_URL = "https://serverless.roboflow.com"
@@ -240,6 +240,265 @@ def code_panel(
       <div class="code-body">{numbered}</div>
     </div>
     """
+
+
+def render_robot_viewer(model_path):
+    """Render a self-contained GLB model inside a Three.js iframe."""
+    if not os.path.exists(model_path):
+        st.warning("Robot model is unavailable. Add assets/robot_arm.glb to the project.")
+        return
+
+    with open(model_path, "rb") as model_file:
+        model_data = base64.b64encode(model_file.read()).decode("ascii")
+
+    viewer_html = """
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0d1117; }
+        #viewer { position: relative; width: 100%; height: 540px; border: 1px solid #30363d;
+          border-radius: 8px; overflow: hidden; background: radial-gradient(circle at 50% 35%, #18212b 0, #0d1117 62%); }
+        canvas { display: block; width: 100%; height: 100%; }
+        .hud { position: absolute; z-index: 2; pointer-events: none; font-family: ui-monospace,
+          SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        .title { top: 16px; left: 18px; color: #e6edf3; font-size: 13px; font-weight: 700; }
+        .title small { display: block; color: #8b949e; font-size: 10px; font-weight: 400;
+          letter-spacing: .08em; margin-top: 5px; }
+        .status { top: 16px; right: 18px; padding: 6px 9px; border: 1px solid #30363d;
+          border-radius: 999px; color: #7ee787; background: rgba(22,27,34,.88); font-size: 10px; }
+        .status::before { content: ""; display: inline-block; width: 6px; height: 6px;
+          border-radius: 50%; background: #3fb950; margin-right: 6px; box-shadow: 0 0 7px #3fb950; }
+        .help { bottom: 15px; left: 18px; color: #8b949e; font-size: 10px;
+          background: rgba(13,17,23,.78); padding: 7px 9px; border-radius: 5px; }
+        .controls { right: 16px; bottom: 16px; width: 250px; padding: 13px 14px;
+          border: 1px solid #30363d; border-radius: 7px; background: rgba(13,17,23,.92);
+          color: #c9d1d9; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .control-head { display: flex; justify-content: space-between; align-items: center;
+          margin-bottom: 10px; color: #e6edf3; font-weight: 700; }
+        .control-head button { pointer-events: auto; border: 1px solid #30363d; border-radius: 4px;
+          padding: 4px 7px; background: #21262d; color: #c9d1d9; cursor: pointer;
+          font: 9px ui-monospace, monospace; }
+        .joint { display: grid; grid-template-columns: 65px 1fr 38px; gap: 7px;
+          align-items: center; margin: 8px 0; }
+        .joint label { color: #8b949e; }
+        .joint output { color: #7ee787; text-align: right; }
+        .joint input { width: 100%; accent-color: #3fb950; pointer-events: auto; cursor: pointer; }
+        .loading { inset: 0; display: grid; place-items: center; color: #58a6ff; font-size: 11px;
+          letter-spacing: .08em; background: #0d1117; transition: opacity .35s ease; }
+        .loading.done { opacity: 0; }
+        @media (max-width: 700px) {
+          .controls { width: calc(100% - 32px); }
+          .help { display: none; }
+        }
+      </style>
+      <script type="importmap">
+        {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}
+      </script>
+    </head>
+    <body>
+      <div id="viewer">
+        <div class="hud title">ROBOT_ARM / CAD_01<small>DIGITAL TWIN · GLTF 2.0</small></div>
+        <div class="hud status" id="status">MODEL LOADING</div>
+        <div class="hud help">DRAG · ROTATE &nbsp;&nbsp; SCROLL · ZOOM &nbsp;&nbsp; RIGHT DRAG · PAN</div>
+        <div class="hud controls">
+          <div class="control-head"><span>JOINT CONTROL</span><button id="reset-joints">RESET</button></div>
+          <div class="joint"><label>BASE</label><input id="base" type="range" min="-90" max="90" value="0"><output>0°</output></div>
+          <div class="joint"><label>SHOULDER</label><input id="shoulder" type="range" min="-55" max="75" value="0"><output>0°</output></div>
+          <div class="joint"><label>ELBOW</label><input id="elbow" type="range" min="-95" max="95" value="0"><output>0°</output></div>
+          <div class="joint"><label>WRIST</label><input id="wrist" type="range" min="-90" max="90" value="0"><output>0°</output></div>
+          <div class="joint"><label>GRIPPER</label><input id="gripper" type="range" min="0" max="35" value="0"><output>0°</output></div>
+        </div>
+        <div class="hud loading" id="loading">INITIALIZING GEOMETRY...</div>
+      </div>
+      <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        const container = document.getElementById('viewer');
+        const loading = document.getElementById('loading');
+        const status = document.getElementById('status');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.Fog(0x0d1117, 10, 24);
+
+        const camera = new THREE.PerspectiveCamera(38, container.clientWidth / container.clientHeight, 0.01, 100);
+        camera.position.set(5.5, 3.8, 7.5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.15;
+        container.prepend(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.06;
+        controls.target.set(0, 1.8, 0);
+        controls.minDistance = 3;
+        controls.maxDistance = 16;
+
+        scene.add(new THREE.HemisphereLight(0xbad7ff, 0x17231c, 2.2));
+        const key = new THREE.DirectionalLight(0xffffff, 3.2);
+        key.position.set(5, 8, 5);
+        scene.add(key);
+        const rim = new THREE.DirectionalLight(0x58a6ff, 2.0);
+        rim.position.set(-5, 4, -4);
+        scene.add(rim);
+
+        const grid = new THREE.GridHelper(14, 28, 0x238636, 0x26313c);
+        grid.material.opacity = 0.45;
+        grid.material.transparent = true;
+        scene.add(grid);
+
+        const joints = {};
+        const gripperParts = {};
+        const deg = THREE.MathUtils.degToRad;
+
+        function buildJointRig(robot) {
+          const normalizedName = (name) => name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
+          const findPart = (name) => {
+            const expected = normalizedName(name);
+            let match = null;
+            robot.traverse((part) => {
+              if (!match && normalizedName(part.name || '') === expected) match = part;
+            });
+            return match;
+          };
+
+          const armRoot = findPart('机械臂');
+          if (!armRoot) throw new Error('Mechanical arm root node not found');
+
+          // Joint centres are taken from the servo locations in the CAD export.
+          const base = new THREE.Group();
+          const shoulder = new THREE.Group();
+          const elbow = new THREE.Group();
+          const wrist = new THREE.Group();
+          base.name = 'joint_base';
+          shoulder.name = 'joint_shoulder';
+          elbow.name = 'joint_elbow';
+          wrist.name = 'joint_wrist';
+          base.position.set(0.0408, 0.0931, 0.0929);
+          shoulder.position.set(0.0432, 0.1263, 0.1424);
+          elbow.position.set(0.0615, 0.2530, 0.1391);
+          wrist.position.set(-0.0332, 0.3181, 0.1118);
+
+          armRoot.add(base, shoulder, elbow, wrist);
+          armRoot.updateMatrixWorld(true);
+          base.attach(shoulder);
+          shoulder.attach(elbow);
+          elbow.attach(wrist);
+
+          const attach = (parent, names) => names.forEach((name) => {
+            const part = findPart(name);
+            if (part) parent.attach(part);
+          });
+          attach(base, ['Waist-1']);
+          attach(shoulder, ['Servo Motor MG996R-2', 'Arm 01-1']);
+          attach(elbow, ['Servo Motor MG996R-7', 'Arm 02 v3-1']);
+          attach(wrist, ['Arm 03-1', 'Servo Motor Micro  9g-1', 'Servo Motor Micro  9g-2', 'Gripper Assembly']);
+
+          joints.base = base;
+          joints.shoulder = shoulder;
+          joints.elbow = elbow;
+          joints.wrist = wrist;
+          gripperParts.left = findPart('Gripper 1-1');
+          gripperParts.right = findPart('Gripper 1-2');
+          if (gripperParts.left) gripperParts.left.userData.closedRotation = gripperParts.left.rotation.clone();
+          if (gripperParts.right) gripperParts.right.userData.closedRotation = gripperParts.right.rotation.clone();
+        }
+
+        function updateJoint(name, value) {
+          const angle = deg(Number(value));
+          if (name === 'base' && joints.base) joints.base.rotation.y = angle;
+          if (name === 'shoulder' && joints.shoulder) joints.shoulder.rotation.z = angle;
+          if (name === 'elbow' && joints.elbow) joints.elbow.rotation.z = angle;
+          if (name === 'wrist' && joints.wrist) joints.wrist.rotation.x = angle;
+          if (name === 'gripper') {
+            if (gripperParts.left) {
+              gripperParts.left.rotation.copy(gripperParts.left.userData.closedRotation);
+              gripperParts.left.rotateY(angle);
+            }
+            if (gripperParts.right) {
+              gripperParts.right.rotation.copy(gripperParts.right.userData.closedRotation);
+              gripperParts.right.rotateY(-angle);
+            }
+          }
+        }
+
+        document.querySelectorAll('.joint input').forEach((input) => {
+          input.addEventListener('input', () => {
+            input.nextElementSibling.value = `${input.value}°`;
+            updateJoint(input.id, input.value);
+          });
+        });
+        document.getElementById('reset-joints').addEventListener('click', () => {
+          document.querySelectorAll('.joint input').forEach((input) => {
+            input.value = 0;
+            input.nextElementSibling.value = '0°';
+            updateJoint(input.id, 0);
+          });
+        });
+
+        const loader = new GLTFLoader();
+        loader.load(
+          'data:model/gltf-binary;base64,__MODEL_DATA__',
+          (gltf) => {
+            const robot = gltf.scene;
+            buildJointRig(robot);
+            let box = new THREE.Box3().setFromObject(robot);
+            const size = box.getSize(new THREE.Vector3());
+            const scale = 4.4 / Math.max(size.x, size.y, size.z);
+            robot.scale.setScalar(scale);
+            box = new THREE.Box3().setFromObject(robot);
+            const center = box.getCenter(new THREE.Vector3());
+            robot.position.set(-center.x, -box.min.y, -center.z);
+            scene.add(robot);
+
+            const fittedBox = new THREE.Box3().setFromObject(robot);
+            const fittedSize = fittedBox.getSize(new THREE.Vector3());
+            controls.target.set(0, fittedSize.y * 0.45, 0);
+            controls.update();
+            status.textContent = 'ARM READY';
+            loading.classList.add('done');
+            setTimeout(() => loading.remove(), 400);
+          },
+          (event) => {
+            if (event.total) loading.textContent = `LOADING MODEL · ${Math.round(event.loaded / event.total * 100)}%`;
+          },
+          (error) => {
+            console.error(error);
+            status.textContent = 'LOAD ERROR';
+            loading.textContent = 'MODEL COULD NOT BE LOADED';
+          }
+        );
+
+        function resize() {
+          const width = container.clientWidth;
+          const height = container.clientHeight;
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+          renderer.setSize(width, height);
+        }
+        window.addEventListener('resize', resize);
+
+        function animate() {
+          requestAnimationFrame(animate);
+          controls.update();
+          renderer.render(scene, camera);
+        }
+        animate();
+      </script>
+    </body>
+    </html>
+    """.replace("__MODEL_DATA__", model_data)
+
+    components.html(viewer_html, height=560, scrolling=False)
 
 
 st.html(
@@ -367,3 +626,6 @@ st.html(
     </div>
     """
 )
+
+st.html('<div class="section-label">04 / <b>Robotic arm digital twin</b></div>')
+render_robot_viewer(os.path.join(os.path.dirname(__file__), "assets", "robot_arm.glb"))
