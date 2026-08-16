@@ -260,7 +260,7 @@ def render_robot_viewer(model_path):
       <style>
         * { box-sizing: border-box; }
         html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #0d1117; }
-        #viewer { position: relative; width: 100%; height: 540px; border: 1px solid #30363d;
+        #viewer { position: relative; width: 100%; height: 620px; border: 1px solid #30363d;
           border-radius: 8px; overflow: hidden; background: radial-gradient(circle at 50% 35%, #18212b 0, #0d1117 62%); }
         canvas { display: block; width: 100%; height: 100%; }
         .hud { position: absolute; z-index: 2; pointer-events: none; font-family: ui-monospace,
@@ -274,7 +274,7 @@ def render_robot_viewer(model_path):
           border-radius: 50%; background: #3fb950; margin-right: 6px; box-shadow: 0 0 7px #3fb950; }
         .help { bottom: 15px; left: 18px; color: #8b949e; font-size: 10px;
           background: rgba(13,17,23,.78); padding: 7px 9px; border-radius: 5px; }
-        .controls { right: 16px; bottom: 16px; width: 250px; padding: 13px 14px;
+        .controls { right: 16px; bottom: 16px; width: 285px; padding: 13px 14px;
           border: 1px solid #30363d; border-radius: 7px; background: rgba(13,17,23,.92);
           color: #c9d1d9; font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
         .control-head { display: flex; justify-content: space-between; align-items: center;
@@ -287,6 +287,15 @@ def render_robot_viewer(model_path):
         .joint label { color: #8b949e; }
         .joint output { color: #7ee787; text-align: right; }
         .joint input { width: 100%; accent-color: #3fb950; pointer-events: auto; cursor: pointer; }
+        .action-row { display: grid; grid-template-columns: 1fr auto; gap: 7px; margin-top: 11px;
+          padding-top: 11px; border-top: 1px solid #30363d; }
+        .action-row button { pointer-events: auto; border-radius: 5px; padding: 8px 9px; cursor: pointer;
+          font: 700 9px ui-monospace, monospace; letter-spacing: .04em; }
+        #run-sequence { color: #fff; background: #238636; border: 1px solid #3fb950; }
+        #run-sequence:hover:not(:disabled) { background: #2ea043; }
+        #run-sequence:disabled, .controls input:disabled { cursor: not-allowed; opacity: .45; }
+        .sequence-state { margin-top: 8px; min-height: 12px; color: #58a6ff; font-size: 9px; }
+        .sim-badge { color: #d29922; }
         .loading { inset: 0; display: grid; place-items: center; color: #58a6ff; font-size: 11px;
           letter-spacing: .08em; background: #0d1117; transition: opacity .35s ease; }
         .loading.done { opacity: 0; }
@@ -311,6 +320,8 @@ def render_robot_viewer(model_path):
           <div class="joint"><label>ELBOW</label><input id="elbow" type="range" min="-95" max="95" value="0"><output>0°</output></div>
           <div class="joint"><label>WRIST</label><input id="wrist" type="range" min="-90" max="90" value="0"><output>0°</output></div>
           <div class="joint"><label>GRIPPER</label><input id="gripper" type="range" min="0" max="35" value="0"><output>0°</output></div>
+          <div class="action-row"><button id="run-sequence" disabled>START AUTO EXTRACTION</button><span class="sim-badge">AUTO IK</span></div>
+          <div class="sequence-state" id="sequence-state">SEARCHING FOR A REACHABLE TARGET...</div>
         </div>
         <div class="hud loading" id="loading">INITIALIZING GEOMETRY...</div>
       </div>
@@ -357,24 +368,79 @@ def render_robot_viewer(model_path):
         scene.add(grid);
 
         const joints = {};
-        const gripperParts = {};
+        const gripper = {};
         const deg = THREE.MathUtils.degToRad;
+        const sequenceState = document.getElementById('sequence-state');
+        const runButton = document.getElementById('run-sequence');
+        let gripPoint = null;
+        let weedTarget = null;
+        let selectedTargetPosition = null;
+        let selectedSolution = null;
+        let interactionPlane = null;
+        let controlsLocked = false;
+        const workspaceCenter = new THREE.Vector3();
+        let sequenceGeneration = 0;
+        const activeTweens = new Set();
+
+        const normalizedName = (name) => name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
+        function findPart(root, name) {
+          const expected = normalizedName(name);
+          let match = null;
+          root.traverse((part) => {
+            if (!match && normalizedName(part.name || '') === expected) match = part;
+          });
+          return match;
+        }
+
+        function jointPointBetween(meshA, meshB) {
+          const boxA = new THREE.Box3().setFromObject(meshA);
+          const boxB = new THREE.Box3().setFromObject(meshB);
+          const overlap = boxA.clone().intersect(boxB);
+          if (!overlap.isEmpty()) return overlap.getCenter(new THREE.Vector3());
+          return boxA.getCenter(new THREE.Vector3())
+            .add(boxB.getCenter(new THREE.Vector3())).multiplyScalar(0.5);
+        }
+
+        function buildJawPivot(assembly, name, partNames) {
+          const pivot = new THREE.Group();
+          pivot.name = name;
+          const parts = partNames.map((partName) => findPart(assembly, partName)).filter(Boolean);
+          if (!parts.length) {
+            assembly.add(pivot);
+            return pivot;
+          }
+          pivot.position.copy(parts[0].position);
+          assembly.add(pivot);
+          parts.forEach((part) => pivot.attach(part));
+          return pivot;
+        }
 
         function buildJointRig(robot) {
-          const normalizedName = (name) => name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
-          const findPart = (name) => {
-            const expected = normalizedName(name);
-            let match = null;
-            robot.traverse((part) => {
-              if (!match && normalizedName(part.name || '') === expected) match = part;
-            });
-            return match;
-          };
-
-          const armRoot = findPart('机械臂');
+          const armRoot = findPart(robot, '机械臂');
           if (!armRoot) throw new Error('Mechanical arm root node not found');
 
-          // Joint centres are taken from the servo locations in the CAD export.
+          const waistMesh = findPart(armRoot, 'Waist-1');
+          const arm01Mesh = findPart(armRoot, 'Arm 01-1');
+          const arm02Mesh = findPart(armRoot, 'Arm 02 v3-1');
+          const arm03Mesh = findPart(armRoot, 'Arm 03-1');
+          const gripperAssembly = findPart(armRoot, 'Gripper Assembly');
+          const servoShoulder = findPart(armRoot, 'Servo Motor MG996R-2');
+          const servoElbow = findPart(armRoot, 'Servo Motor MG996R-7');
+          const servoWrist1 = findPart(armRoot, 'Servo Motor Micro 9g-1');
+          const servoWrist2 = findPart(armRoot, 'Servo Motor Micro 9g-2');
+          if (![waistMesh, arm01Mesh, arm02Mesh, arm03Mesh, gripperAssembly].every(Boolean)) {
+            throw new Error('Required CAD nodes are missing');
+          }
+
+          robot.updateMatrixWorld(true);
+          const waistArm01 = jointPointBetween(waistMesh, arm01Mesh);
+          const arm01Arm02 = jointPointBetween(arm01Mesh, arm02Mesh);
+          const arm02Arm03 = jointPointBetween(arm02Mesh, arm03Mesh);
+          const waistCenter = new THREE.Box3().setFromObject(waistMesh).getCenter(new THREE.Vector3());
+
+          const armMount = new THREE.Group();
+          armMount.name = 'RobotArmMount';
+          robot.add(armMount);
           const base = new THREE.Group();
           const shoulder = new THREE.Group();
           const elbow = new THREE.Group();
@@ -383,52 +449,70 @@ def render_robot_viewer(model_path):
           shoulder.name = 'joint_shoulder';
           elbow.name = 'joint_elbow';
           wrist.name = 'joint_wrist';
-          base.position.set(0.0408, 0.0931, 0.0929);
-          shoulder.position.set(0.0432, 0.1263, 0.1424);
-          elbow.position.set(0.0615, 0.2530, 0.1391);
-          wrist.position.set(-0.0332, 0.3181, 0.1118);
+          base.position.set(waistCenter.x, 0, waistCenter.z);
+          armMount.add(base);
+          shoulder.position.copy(waistArm01.clone().sub(base.position));
+          base.add(shoulder);
+          const shoulderAbs = base.position.clone().add(shoulder.position);
+          elbow.position.copy(arm01Arm02.clone().sub(shoulderAbs));
+          shoulder.add(elbow);
+          const elbowAbs = shoulderAbs.clone().add(elbow.position);
+          wrist.position.copy(arm02Arm03.clone().sub(elbowAbs));
+          elbow.add(wrist);
 
-          armRoot.add(base, shoulder, elbow, wrist);
-          armRoot.updateMatrixWorld(true);
-          base.attach(shoulder);
-          shoulder.attach(elbow);
-          elbow.attach(wrist);
-
-          const attach = (parent, names) => names.forEach((name) => {
-            const part = findPart(name);
-            if (part) parent.attach(part);
-          });
-          attach(base, ['Waist-1']);
-          attach(shoulder, ['Servo Motor MG996R-2', 'Arm 01-1']);
-          attach(elbow, ['Servo Motor MG996R-7', 'Arm 02 v3-1']);
-          attach(wrist, ['Arm 03-1', 'Servo Motor Micro  9g-1', 'Servo Motor Micro  9g-2', 'Gripper Assembly']);
+          base.attach(waistMesh);
+          if (servoShoulder) base.attach(servoShoulder);
+          shoulder.attach(arm01Mesh);
+          elbow.attach(arm02Mesh);
+          if (servoElbow) elbow.attach(servoElbow);
+          wrist.attach(arm03Mesh);
+          if (servoWrist1) wrist.attach(servoWrist1);
+          if (servoWrist2) wrist.attach(servoWrist2);
+          wrist.attach(gripperAssembly);
 
           joints.base = base;
           joints.shoulder = shoulder;
           joints.elbow = elbow;
           joints.wrist = wrist;
-          gripperParts.left = findPart('Gripper 1-1');
-          gripperParts.right = findPart('Gripper 1-2');
-          if (gripperParts.left) gripperParts.left.userData.closedRotation = gripperParts.left.rotation.clone();
-          if (gripperParts.right) gripperParts.right.userData.closedRotation = gripperParts.right.rotation.clone();
+          gripper.left = buildJawPivot(gripperAssembly, 'GripperLeft', [
+            'Gripper 1-2', 'gear1-1', 'grip link 1-1', 'grip link 1-4'
+          ]);
+          gripper.right = buildJawPivot(gripperAssembly, 'GripperRight', [
+            'Gripper 1-1', 'gear2-1', 'grip link 1-2', 'grip link 1-3'
+          ]);
+          gripPoint = new THREE.Group();
+          gripPoint.name = 'GripPoint';
+          gripPoint.position.copy(gripper.left.position.clone().add(gripper.right.position).multiplyScalar(0.8));
+          gripperAssembly.add(gripPoint);
+        }
+
+        function setJawAngle(angle) {
+          if (gripper.left) gripper.left.rotation.y = angle;
+          if (gripper.right) gripper.right.rotation.y = -angle;
         }
 
         function updateJoint(name, value) {
           const angle = deg(Number(value));
           if (name === 'base' && joints.base) joints.base.rotation.y = angle;
-          if (name === 'shoulder' && joints.shoulder) joints.shoulder.rotation.z = angle;
-          if (name === 'elbow' && joints.elbow) joints.elbow.rotation.z = angle;
+          if (name === 'shoulder' && joints.shoulder) joints.shoulder.rotation.x = angle;
+          if (name === 'elbow' && joints.elbow) joints.elbow.rotation.y = angle;
           if (name === 'wrist' && joints.wrist) joints.wrist.rotation.x = angle;
-          if (name === 'gripper') {
-            if (gripperParts.left) {
-              gripperParts.left.rotation.copy(gripperParts.left.userData.closedRotation);
-              gripperParts.left.rotateY(angle);
-            }
-            if (gripperParts.right) {
-              gripperParts.right.rotation.copy(gripperParts.right.userData.closedRotation);
-              gripperParts.right.rotateY(-angle);
-            }
-          }
+          if (name === 'gripper') setJawAngle(angle);
+        }
+
+        function syncControls() {
+          const values = {
+            base: THREE.MathUtils.radToDeg(joints.base?.rotation.y || 0),
+            shoulder: THREE.MathUtils.radToDeg(joints.shoulder?.rotation.x || 0),
+            elbow: THREE.MathUtils.radToDeg(joints.elbow?.rotation.y || 0),
+            wrist: THREE.MathUtils.radToDeg(joints.wrist?.rotation.x || 0),
+            gripper: Math.abs(THREE.MathUtils.radToDeg(gripper.left?.rotation.y || 0)),
+          };
+          Object.entries(values).forEach(([name, value]) => {
+            const input = document.getElementById(name);
+            input.value = Math.round(value);
+            input.nextElementSibling.value = `${Math.round(value)}°`;
+          });
         }
 
         document.querySelectorAll('.joint input').forEach((input) => {
@@ -437,13 +521,405 @@ def render_robot_viewer(model_path):
             updateJoint(input.id, input.value);
           });
         });
-        document.getElementById('reset-joints').addEventListener('click', () => {
-          document.querySelectorAll('.joint input').forEach((input) => {
-            input.value = 0;
-            input.nextElementSibling.value = '0°';
-            updateJoint(input.id, 0);
+
+        function setControlsDisabled(disabled) {
+          controlsLocked = disabled;
+          document.querySelectorAll('.joint input').forEach((input) => { input.disabled = disabled; });
+          runButton.disabled = disabled || !selectedTargetPosition || !selectedSolution;
+        }
+
+        function easeInOutCubic(t) {
+          return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+        function tween(target, values, duration) {
+          return new Promise((resolve) => {
+            activeTweens.add({ target, values, duration, elapsed: 0,
+              from: Object.fromEntries(Object.keys(values).map((key) => [key, target[key]])), resolve });
           });
-        });
+        }
+        function updateTweens(dt) {
+          for (const item of [...activeTweens]) {
+            item.elapsed += dt;
+            const t = Math.min(1, item.elapsed / item.duration);
+            const eased = easeInOutCubic(t);
+            Object.keys(item.values).forEach((key) => {
+              item.target[key] = item.from[key] + (item.values[key] - item.from[key]) * eased;
+            });
+            if (t >= 1) {
+              activeTweens.delete(item);
+              item.resolve();
+            }
+          }
+        }
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        function cancelTweens() {
+          for (const item of activeTweens) item.resolve();
+          activeTweens.clear();
+        }
+
+        function buildWeedTarget() {
+          const target = new THREE.Group();
+          const plant = new THREE.Group();
+          const stem = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.035, 0.055, 0.55, 8),
+            new THREE.MeshStandardMaterial({ color: 0x3fb950, roughness: 0.75 })
+          );
+          stem.position.y = 0.27;
+          plant.add(stem);
+          for (let i = 0; i < 6; i++) {
+            const leaf = new THREE.Mesh(
+              new THREE.ConeGeometry(0.11, 0.42, 5),
+              new THREE.MeshStandardMaterial({ color: i % 2 ? 0x56d364 : 0x2ea043, side: THREE.DoubleSide })
+            );
+            const a = i / 6 * Math.PI * 2;
+            leaf.position.set(Math.cos(a) * 0.05, 0.38, Math.sin(a) * 0.05);
+            leaf.rotation.set(Math.sin(a) * 0.75, a, Math.cos(a) * 0.75);
+            plant.add(leaf);
+          }
+          const ring = new THREE.Mesh(
+            new THREE.RingGeometry(0.28, 0.34, 36),
+            new THREE.MeshBasicMaterial({ color: 0xf85149, transparent: true, opacity: 0.9, side: THREE.DoubleSide })
+          );
+          ring.rotation.x = -Math.PI / 2;
+          ring.position.y = 0.012;
+          target.add(plant, ring);
+          target.visible = false;
+          scene.add(target);
+          return { target, plant, ring, pulse: 0 };
+        }
+
+        function setupTargetPlacement() {
+          // Visual guide only: every click still goes through the IK reachability check.
+          const reachGuide = new THREE.Mesh(
+            new THREE.RingGeometry(1.1, 4.1, 72),
+            new THREE.MeshBasicMaterial({
+              color: 0x3fb950,
+              transparent: true,
+              opacity: 0.16,
+              side: THREE.DoubleSide,
+              depthWrite: false
+            })
+          );
+          reachGuide.rotation.x = -Math.PI / 2;
+          reachGuide.position.set(workspaceCenter.x, 0.006, workspaceCenter.z);
+          scene.add(reachGuide);
+
+          interactionPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(12, 12),
+            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide })
+          );
+          interactionPlane.rotation.x = -Math.PI / 2;
+          interactionPlane.position.y = 0.008;
+          scene.add(interactionPlane);
+
+          const raycaster = new THREE.Raycaster();
+          const pointer = new THREE.Vector2();
+          renderer.domElement.addEventListener('pointerdown', (event) => {
+            if (!event.shiftKey || controlsLocked) return;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            const rect = renderer.domElement.getBoundingClientRect();
+            pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(pointer, camera);
+            const hit = raycaster.intersectObject(interactionPlane, false)[0];
+            if (!hit) return;
+
+            const radius = Math.hypot(
+              hit.point.x - workspaceCenter.x,
+              hit.point.z - workspaceCenter.z
+            );
+            if (radius < 1.1 || radius > 4.1) {
+              status.textContent = 'OUTSIDE WORKSPACE';
+              sequenceState.textContent = 'PLACE WEED INSIDE GREEN CANDIDATE AREA';
+              return;
+            }
+
+            const candidate = hit.point.clone();
+            candidate.y = 0;
+            selectedTargetPosition = candidate;
+            selectedSolution = null;
+            weedTarget.target.attach(weedTarget.plant);
+            weedTarget.plant.position.set(0, 0, 0);
+            weedTarget.target.position.copy(candidate);
+            weedTarget.target.visible = true;
+            weedTarget.plant.visible = true;
+            weedTarget.ring.visible = true;
+
+            const grabCandidate = candidate.clone();
+            grabCandidate.y = 0.42;
+            const variables = jointVariables();
+            const savedPose = variables.map((v) => v.joint.rotation[v.axis]);
+            status.textContent = 'CHECKING REACH';
+            sequenceState.textContent = 'IK VALIDATION IN PROGRESS';
+            const candidateSolution = solveIK(grabCandidate);
+            variables.forEach((v, index) => { v.joint.rotation[v.axis] = savedPose[index]; });
+            scene.updateMatrixWorld(true);
+
+            if (candidateSolution.error > 0.22) {
+              selectedSolution = null;
+              status.textContent = 'POINT UNREACHABLE';
+              sequenceState.textContent = `WEED PLACED · IK ERROR ${candidateSolution.error.toFixed(2)}m · TRY ANOTHER POINT`;
+              setControlsDisabled(false);
+              return;
+            }
+
+            selectedSolution = candidateSolution;
+            status.textContent = 'TARGET PLACED';
+            sequenceState.textContent = `TARGET X ${selectedTargetPosition.x.toFixed(2)} / Z ${selectedTargetPosition.z.toFixed(2)}`;
+            setControlsDisabled(false);
+          }, true);
+        }
+
+        function prepareAutoTarget() {
+          const variables = jointVariables();
+          const savedPose = variables.map((v) => v.joint.rotation[v.axis]);
+          let bestCandidate = null;
+
+          // Search around the real CAD base and keep the target with the lowest IK error.
+          const radii = [1.45, 1.9, 2.35, 2.8, 3.25, 3.7];
+          const angles = [0, 45, 90, 135, 180, 225, 270, 315].map(deg);
+          search:
+          for (const radius of radii) {
+            for (const angle of angles) {
+              const position = new THREE.Vector3(
+                workspaceCenter.x + Math.cos(angle) * radius,
+                0,
+                workspaceCenter.z + Math.sin(angle) * radius
+              );
+              const grabTarget = position.clone();
+              grabTarget.y = 0.42;
+              const solution = solveIK(grabTarget);
+              if (!bestCandidate || solution.error < bestCandidate.solution.error) {
+                bestCandidate = { position, solution };
+              }
+              if (solution.error < 0.1) break search;
+            }
+          }
+
+          variables.forEach((v, index) => { v.joint.rotation[v.axis] = savedPose[index]; });
+          scene.updateMatrixWorld(true);
+
+          if (!bestCandidate || bestCandidate.solution.error > 0.22) {
+            selectedTargetPosition = null;
+            selectedSolution = null;
+            weedTarget.target.visible = false;
+            status.textContent = 'AUTO TARGET ERROR';
+            sequenceState.textContent = 'NO SAFE IK TARGET FOUND';
+            setControlsDisabled(false);
+            return;
+          }
+
+          selectedTargetPosition = bestCandidate.position;
+          selectedSolution = bestCandidate.solution;
+          weedTarget.target.attach(weedTarget.plant);
+          weedTarget.plant.position.set(0, 0, 0);
+          weedTarget.target.position.copy(selectedTargetPosition);
+          weedTarget.target.visible = true;
+          weedTarget.plant.visible = true;
+          weedTarget.ring.visible = true;
+          status.textContent = 'AUTO TARGET READY';
+          sequenceState.textContent = `IK LOCKED · ERROR ${selectedSolution.error.toFixed(2)}m · PRESS START`;
+          setControlsDisabled(false);
+        }
+
+        function resetRig(clearTarget = true) {
+          sequenceGeneration++;
+          cancelTweens();
+          if (joints.base) joints.base.rotation.set(0, 0, 0);
+          if (joints.shoulder) joints.shoulder.rotation.set(0, 0, 0);
+          if (joints.elbow) joints.elbow.rotation.set(0, 0, 0);
+          if (joints.wrist) joints.wrist.rotation.set(0, 0, 0);
+          setJawAngle(deg(12));
+          if (weedTarget) {
+            weedTarget.target.attach(weedTarget.plant);
+            weedTarget.plant.position.set(0, 0, 0);
+            if (clearTarget) {
+              selectedTargetPosition = null;
+              selectedSolution = null;
+              weedTarget.plant.visible = false;
+              weedTarget.target.visible = false;
+            }
+          }
+          status.textContent = 'ARM READY';
+          sequenceState.textContent = selectedTargetPosition
+            ? 'TARGET READY · PRESS MOVE TO TARGET'
+            : 'GREEN = CANDIDATE · SHIFT + CLICK TO IK CHECK';
+          setControlsDisabled(false);
+          syncControls();
+        }
+
+        function jointVariables() {
+          return [
+            { name: 'base', joint: joints.base, axis: 'y', min: deg(-90), max: deg(90) },
+            { name: 'shoulder', joint: joints.shoulder, axis: 'x', min: deg(-55), max: deg(75) },
+            { name: 'elbow', joint: joints.elbow, axis: 'y', min: deg(-105), max: deg(105) },
+            { name: 'wrist', joint: joints.wrist, axis: 'x', min: deg(-90), max: deg(90) },
+          ];
+        }
+
+        function solveIK(target) {
+          const variables = jointVariables();
+          const effector = new THREE.Vector3();
+          const shifted = new THREE.Vector3();
+          const epsilon = 0.004;
+          const damping = 0.04;
+          let best = { error: Infinity, pose: null };
+          const seeds = [];
+          for (const base of [-85, -45, 0, 45, 85]) {
+            for (const shoulder of [-40, 10, 60]) {
+              for (const elbow of [-85, 0, 85]) {
+                seeds.push([base, shoulder, elbow, 0]);
+              }
+            }
+          }
+
+          for (const seed of seeds) {
+            variables.forEach((v, index) => { v.joint.rotation[v.axis] = deg(seed[index]); });
+
+            for (let iteration = 0; iteration < 85; iteration++) {
+              scene.updateMatrixWorld(true);
+              gripPoint.getWorldPosition(effector);
+              const error = target.clone().sub(effector);
+              if (error.length() < 0.08) break;
+
+              const columns = variables.map((variable) => {
+                const original = variable.joint.rotation[variable.axis];
+                variable.joint.rotation[variable.axis] = original + epsilon;
+                scene.updateMatrixWorld(true);
+                gripPoint.getWorldPosition(shifted);
+                variable.joint.rotation[variable.axis] = original;
+                return shifted.clone().sub(effector).divideScalar(epsilon);
+              });
+
+              let xx = damping, xy = 0, xz = 0, yy = damping, yz = 0, zz = damping;
+              columns.forEach((c) => {
+                xx += c.x * c.x; xy += c.x * c.y; xz += c.x * c.z;
+                yy += c.y * c.y; yz += c.y * c.z; zz += c.z * c.z;
+              });
+              const inverse = new THREE.Matrix3().set(xx, xy, xz, xy, yy, yz, xz, yz, zz).invert();
+              const correction = error.clone().applyMatrix3(inverse);
+              variables.forEach((variable, index) => {
+                const delta = THREE.MathUtils.clamp(columns[index].dot(correction) * 0.75, -0.2, 0.2);
+                variable.joint.rotation[variable.axis] = THREE.MathUtils.clamp(
+                  variable.joint.rotation[variable.axis] + delta, variable.min, variable.max
+                );
+              });
+            }
+
+            scene.updateMatrixWorld(true);
+            gripPoint.getWorldPosition(effector);
+            const finalError = effector.distanceTo(target);
+            if (finalError < best.error) {
+              best = {
+                error: finalError,
+                pose: Object.fromEntries(variables.map((v) => [v.name, v.joint.rotation[v.axis]])),
+              };
+            }
+            if (best.error < 0.08) break;
+          }
+
+          return best;
+        }
+
+        async function runExtractionSequence() {
+          if (!selectedTargetPosition) return;
+          const generation = ++sequenceGeneration;
+          const current = () => generation === sequenceGeneration;
+          setControlsDisabled(true);
+
+          status.textContent = 'RETURNING HOME';
+          sequenceState.textContent = '01 / NORMALIZE START POSE';
+          await Promise.all([
+            tween(joints.base.rotation, { x: 0, y: 0, z: 0 }, 550),
+            tween(joints.shoulder.rotation, { x: 0, y: 0, z: 0 }, 550),
+            tween(joints.elbow.rotation, { x: 0, y: 0, z: 0 }, 550),
+            tween(joints.wrist.rotation, { x: 0, y: 0, z: 0 }, 550),
+            tween(gripper.left.rotation, { y: deg(26) }, 550),
+            tween(gripper.right.rotation, { y: deg(-26) }, 550),
+          ]);
+          if (!current()) return;
+
+          const grabTarget = selectedTargetPosition.clone();
+          grabTarget.y = 0.42;
+          const solution = selectedSolution || solveIK(grabTarget);
+          jointVariables().forEach((v) => { v.joint.rotation[v.axis] = 0; });
+          scene.updateMatrixWorld(true);
+
+          if (solution.error > 0.22) {
+            status.textContent = 'TARGET OUT OF REACH';
+            sequenceState.textContent = `IK ERROR ${solution.error.toFixed(2)}m · PLACE TARGET CLOSER`;
+            setControlsDisabled(false);
+            syncControls();
+            return;
+          }
+
+          status.textContent = 'IK SOLVED';
+          sequenceState.textContent = '02 / BASE ALIGNMENT';
+          await tween(joints.base.rotation, { y: solution.pose.base }, 650);
+          if (!current()) return;
+
+          status.textContent = 'MOVING TO TARGET';
+          sequenceState.textContent = '03 / COORDINATED JOINT MOTION';
+          await Promise.all([
+            tween(joints.shoulder.rotation, { x: solution.pose.shoulder }, 1200),
+            tween(joints.elbow.rotation, { y: solution.pose.elbow }, 1200),
+            tween(joints.wrist.rotation, { x: solution.pose.wrist }, 1200),
+          ]);
+          if (!current()) return;
+
+          scene.updateMatrixWorld(true);
+          const reached = new THREE.Vector3();
+          gripPoint.getWorldPosition(reached);
+          const reachError = reached.distanceTo(grabTarget);
+          if (reachError > 0.18) {
+            status.textContent = 'APPROACH FAILED';
+            sequenceState.textContent = `SAFETY STOP · GRIP ERROR ${reachError.toFixed(2)}m`;
+            setControlsDisabled(false);
+            syncControls();
+            return;
+          }
+
+          status.textContent = 'GRIPPING';
+          sequenceState.textContent = '04 / TARGET WITHIN GRIP TOLERANCE';
+          await Promise.all([
+            tween(gripper.left.rotation, { y: deg(2) }, 450),
+            tween(gripper.right.rotation, { y: deg(-2) }, 450),
+          ]);
+          if (!current()) return;
+          gripPoint.attach(weedTarget.plant);
+          weedTarget.ring.visible = false;
+
+          status.textContent = 'PULLING WEED';
+          sequenceState.textContent = '05 / EXTRACTION';
+          await tween(joints.shoulder.rotation, { x: solution.pose.shoulder - deg(22) }, 750);
+          await wait(350);
+          if (!current()) return;
+
+          status.textContent = 'RETURNING HOME';
+          sequenceState.textContent = '06 / RETURN HOME';
+          weedTarget.plant.visible = false;
+          await Promise.all([
+            tween(joints.base.rotation, { y: 0 }, 800),
+            tween(joints.shoulder.rotation, { x: 0 }, 800),
+            tween(joints.elbow.rotation, { y: 0 }, 800),
+            tween(joints.wrist.rotation, { x: 0 }, 800),
+            tween(gripper.left.rotation, { y: deg(12) }, 800),
+            tween(gripper.right.rotation, { y: deg(-12) }, 800),
+          ]);
+          if (!current()) return;
+          weedTarget.target.visible = false;
+          selectedTargetPosition = null;
+          selectedSolution = null;
+          syncControls();
+          status.textContent = 'PREPARING NEXT TARGET';
+          sequenceState.textContent = 'AUTO IK SEARCH';
+          prepareAutoTarget();
+        }
+
+        runButton.addEventListener('click', runExtractionSequence);
+        document.getElementById('reset-joints').addEventListener('click', () => resetRig(false));
 
         const loader = new GLTFLoader();
         loader.load(
@@ -459,12 +935,33 @@ def render_robot_viewer(model_path):
             const center = box.getCenter(new THREE.Vector3());
             robot.position.set(-center.x, -box.min.y, -center.z);
             scene.add(robot);
+            robot.updateMatrixWorld(true);
+            joints.base.getWorldPosition(workspaceCenter);
+            workspaceCenter.y = 0;
+
+            weedTarget = buildWeedTarget();
 
             const fittedBox = new THREE.Box3().setFromObject(robot);
             const fittedSize = fittedBox.getSize(new THREE.Vector3());
-            controls.target.set(0, fittedSize.y * 0.45, 0);
+            const fittedCenter = fittedBox.getCenter(new THREE.Vector3());
+            const maxDim = Math.max(fittedSize.x, fittedSize.y, fittedSize.z);
+            const distance = ((maxDim / 2) / Math.tan(deg(camera.fov / 2))) * 1.65;
+            controls.target.copy(fittedCenter);
+            camera.position.set(
+              fittedCenter.x + distance * 0.85,
+              fittedCenter.y + distance * 0.35,
+              fittedCenter.z + distance * 0.85
+            );
+            camera.near = Math.max(0.01, distance / 100);
+            camera.far = distance * 20;
+            camera.updateProjectionMatrix();
+            controls.minDistance = distance * 0.45;
+            controls.maxDistance = distance * 3;
             controls.update();
-            status.textContent = 'ARM READY';
+            resetRig();
+            status.textContent = 'SEARCHING TARGET';
+            sequenceState.textContent = 'AUTO IK SEARCH';
+            setTimeout(prepareAutoTarget, 50);
             loading.classList.add('done');
             setTimeout(() => loading.remove(), 400);
           },
@@ -487,8 +984,16 @@ def render_robot_viewer(model_path):
         }
         window.addEventListener('resize', resize);
 
+        const clock = new THREE.Clock();
         function animate() {
           requestAnimationFrame(animate);
+          const dt = Math.min(50, clock.getDelta() * 1000);
+          updateTweens(dt);
+          if (weedTarget?.target.visible && weedTarget.ring.visible) {
+            weedTarget.pulse += dt / 1000;
+            const pulse = 1 + Math.sin(weedTarget.pulse * 4) * 0.08;
+            weedTarget.ring.scale.setScalar(pulse);
+          }
           controls.update();
           renderer.render(scene, camera);
         }
@@ -498,7 +1003,7 @@ def render_robot_viewer(model_path):
     </html>
     """.replace("__MODEL_DATA__", model_data)
 
-    components.html(viewer_html, height=560, scrolling=False)
+    components.html(viewer_html, height=640, scrolling=False)
 
 
 st.html(
